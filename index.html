@@ -1,1 +1,518 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>three.js xr - dragging trophy with depth sensing + Gamepad</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <style>
+        body {
+            margin: 0;
+            background-color: #000;
+            color: #fff;
+            font-family: sans-serif;
+            overflow: hidden;
+        }
+        #info {
+            position: absolute;
+            top: 10px;
+            width: 100%;
+            text-align: center;
+            z-index: 100;
+            pointer-events: none;
+            font-size: 14px;
+            text-shadow: 1px 1px 2px #000;
+        }
+        a { color: #4af; text-decoration: none; }
+        #status {
+            position: absolute;
+            bottom: 10px;
+            width: 100%;
+            text-align: center;
+            color: #0f0;
+            font-family: monospace;
+            font-size: 13px;
+            pointer-events: none;
+            text-shadow: 1px 1px 2px #000;
+            z-index: 100;
+            line-height: 1.5;
+        }
+        #controls-help {
+            position: absolute;
+            top: 40px;
+            left: 10px;
+            color: #fff;
+            font-family: monospace;
+            font-size: 11px;
+            pointer-events: none;
+            text-shadow: 1px 1px 2px #000;
+            z-index: 100;
+            background: rgba(0,0,0,0.4);
+            padding: 8px;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+<body>
 
+    <div id="info">
+        <a href="https://threejs.org" target="_blank" rel="noopener">three.js</a> xr - dragging trophy with Gamepad + Depth Sensing
+    </div>
+
+    <div id="controls-help">
+        ┌─ Xbox Robot White ─┐<br>
+        │ L-Stick : Cursor   │<br>
+        │ D-Pad ↑↓: Z Depth  │<br>
+        │ A       : Grab     │<br>
+        │ B       : Release  │<br>
+        │ Y       : Place    │<br>
+        └────────────────────┘
+    </div>
+
+    <div id="status">Iniciando...</div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "./build/three.module.js",
+                "three/addons/": "./jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { TransformControls } from 'three/addons/controls/TransformControls.js';
+        import { XRButton } from 'three/addons/webxr/XRButton.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        let container;
+        let camera, scene, renderer;
+        let controls, transformControls;
+        let group, trophyContainer;
+        let cursorMesh;
+        let raycaster;
+        let hitTestSource = null;
+        let hitTestSourceRequested = false;
+        const clock = new THREE.Clock();
+
+        let gamepadIndex = null;
+        const prevButtonStates = {};
+        let isPointerDown = false;
+        let cursorScreen = { x: window.innerWidth / 2, y: window.innerHeight / 2 };
+        const CURSOR_SPEED = 9.0;
+        const Z_SPEED = 0.025;
+        const DEAD_ZONE = 0.15;
+        const DEPTH_EPSILON = 0.03;
+
+        let isDepthSupplied = false;
+        let currentRealDepth = -1;
+        const statusEl = document.getElementById('status');
+
+        init();
+        animate();
+
+        function init() {
+            container = document.createElement('div');
+            document.body.appendChild(container);
+
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x808080);
+
+            camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 10);
+            camera.position.set(0, 1.6, 3);
+
+            controls = new OrbitControls(camera, container);
+            controls.target.set(0, 1.6, 0);
+            controls.update();
+
+            const floorGeometry = new THREE.PlaneGeometry(6, 6);
+            const floorMaterial = new THREE.ShadowMaterial({ opacity: 0.25, blending: THREE.CustomBlending, transparent: false });
+            const floor = new THREE.Mesh(floorGeometry, floorMaterial);
+            floor.rotation.x = -Math.PI / 2;
+            floor.receiveShadow = true;
+            floor.name = 'floor';
+            scene.add(floor);
+
+            scene.add(new THREE.HemisphereLight(0xbcbcbc, 0xa5a5a5, 3));
+
+            const light = new THREE.DirectionalLight(0xffffff, 3);
+            light.position.set(0, 6, 0);
+            light.castShadow = true;
+            light.shadow.camera.top = 3;
+            light.shadow.camera.bottom = -3;
+            light.shadow.camera.right = 3;
+            light.shadow.camera.left = -3;
+            light.shadow.mapSize.set(4096, 4096);
+            scene.add(light);
+
+            group = new THREE.Group();
+            scene.add(group);
+
+            const geometry = new THREE.BoxGeometry(0.4, 0.4, 0.4);
+            const hitMaterial = new THREE.MeshBasicMaterial({
+                transparent: true,
+                opacity: 0.0,
+                depthWrite: false,
+                depthTest: false
+            });
+            trophyContainer = new THREE.Mesh(geometry, hitMaterial);
+            trophyContainer.position.set(0, 1.0, -1.5);
+            trophyContainer.name = "trophyContainer";
+            trophyContainer.renderOrder = -1;
+            group.add(trophyContainer);
+
+            const loader = new GLTFLoader();
+            loader.load('./models/gltf/Trophy.glb', function (gltf) {
+                const trophyModel = gltf.scene;
+                trophyModel.traverse(function (child) {
+                    if (child.isMesh) {
+                        child.castShadow = true;
+                        child.receiveShadow = true;
+                    }
+                });
+                trophyModel.scale.set(1.8, 1.8, 1.8);
+                trophyModel.position.set(0, 0, 0);
+                trophyModel.name = "animatedItem";
+                trophyContainer.add(trophyModel);
+            }, undefined, function (error) {
+                console.error('Error al cargar el trofeo:', error);
+            });
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.shadowMap.enabled = true;
+            renderer.xr.enabled = true;
+            container.appendChild(renderer.domElement);
+
+            document.body.appendChild(XRButton.createButton(renderer, {
+                'requiredFeatures': ['hit-test'],
+                'optionalFeatures': ['depth-sensing'],
+                'depthSensing': {
+                    'usagePreference': ['gpu-optimized', 'cpu-optimized'],
+                    'dataFormatPreference': ['luminance-alpha', 'float32']
+                }
+            }));
+
+            // ─── TRANSFORM CONTROLS: SOLO TRASLACION ───
+            transformControls = new TransformControls(camera, renderer.domElement);
+            transformControls.attach(trophyContainer);
+            transformControls.setSize(0.75);
+            transformControls.setMode('translate');
+            transformControls.showX = true;
+            transformControls.showY = true;
+            transformControls.showZ = true;
+            scene.add(transformControls);
+
+            transformControls.addEventListener('dragging-changed', function (event) {
+                controls.enabled = !event.value;
+            });
+
+            // ─── OPCION A: Resetear rotacion al soltar ───
+            transformControls.addEventListener('change', function () {
+                if (!transformControls.dragging) {
+                    trophyContainer.rotation.set(0, 0, 0);
+                }
+            });
+
+            const cursorGeo = new THREE.SphereGeometry(0.025, 16, 16);
+            const cursorMat = new THREE.MeshBasicMaterial({
+                color: 0x00ffff,
+                transparent: true,
+                opacity: 0.8,
+                depthTest: false
+            });
+            cursorMesh = new THREE.Mesh(cursorGeo, cursorMat);
+            cursorMesh.renderOrder = 999;
+            scene.add(cursorMesh);
+
+            raycaster = new THREE.Raycaster();
+
+            window.addEventListener('resize', onWindowResize);
+            window.addEventListener('gamepadconnected', onGamepadConnected);
+            window.addEventListener('gamepaddisconnected', onGamepadDisconnected);
+
+            renderer.xr.addEventListener('sessionstart', onARSessionStart);
+            renderer.xr.addEventListener('sessionend', onARSessionEnd);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function onARSessionStart() {
+            const session = renderer.xr.getSession();
+            controls.enabled = false;
+            scene.background = null;
+
+            if (!hitTestSourceRequested) {
+                session.requestReferenceSpace('viewer').then((refSpace) => {
+                    session.requestHitTestSource({ space: refSpace }).then((source) => {
+                        hitTestSource = source;
+                    });
+                });
+                session.addEventListener('end', () => {
+                    hitTestSourceRequested = false;
+                    hitTestSource = null;
+                });
+                hitTestSourceRequested = true;
+            }
+            updateStatus();
+        }
+
+        function onARSessionEnd() {
+            controls.enabled = true;
+            scene.background = new THREE.Color(0x808080);
+            updateStatus();
+        }
+
+        function onGamepadConnected(e) {
+            console.log('Gamepad conectado:', e.gamepad.id);
+            gamepadIndex = e.gamepad.index;
+            updateStatus();
+        }
+
+        function onGamepadDisconnected(e) {
+            if (gamepadIndex === e.gamepad.index) {
+                gamepadIndex = null;
+            }
+            updateStatus();
+        }
+
+        // ─── COLOCAR OBJETO EN SUPERFICIE REAL (Hit-Test) ───
+        // Se invoca cuando se presiona el boton Y del gamepad.
+        function tryPlaceOnSurface(frame, referenceSpace) {
+            if (!hitTestSource || !frame) return false;
+
+            const hitTestResults = frame.getHitTestResults(hitTestSource);
+            if (hitTestResults.length > 0) {
+                const hit = hitTestResults[0];
+                const pose = hit.getPose(referenceSpace);
+                if (pose) {
+                    trophyContainer.position.set(
+                        pose.transform.position.x,
+                        pose.transform.position.y + 0.2,
+                        pose.transform.position.z
+                    );
+                    trophyContainer.rotation.set(0, 0, 0);
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // ─── POLLING DEL GAMEPAD ───
+        function pollGamepad(frame, referenceSpace) {
+            if (gamepadIndex === null) {
+                const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+                for (let i = 0; i < pads.length; i++) {
+                    if (pads[i]) {
+                        gamepadIndex = i;
+                        break;
+                    }
+                }
+            }
+            if (gamepadIndex === null) return;
+
+            const gamepad = navigator.getGamepads()[gamepadIndex];
+            if (!gamepad) return;
+
+            const buttons = gamepad.buttons;
+            const axes = gamepad.axes;
+
+            // ── Movimiento del cursor con joystick izquierdo (ejes 0,1) ──
+            let dx = 0, dy = 0;
+            if (Math.abs(axes[0]) > DEAD_ZONE) dx = axes[0];
+            if (Math.abs(axes[1]) > DEAD_ZONE) dy = axes[1];
+
+            cursorScreen.x += dx * CURSOR_SPEED;
+            cursorScreen.y += dy * CURSOR_SPEED;
+            cursorScreen.x = THREE.MathUtils.clamp(cursorScreen.x, 0, window.innerWidth);
+            cursorScreen.y = THREE.MathUtils.clamp(cursorScreen.y, 0, window.innerHeight);
+
+            // ── D-Pad: ajuste manual del eje Z (profundidad) ──
+            if (buttons[12] && buttons[12].pressed) {
+                moveObjectInDepth(Z_SPEED);
+            }
+            if (buttons[13] && buttons[13].pressed) {
+                moveObjectInDepth(-Z_SPEED);
+            }
+
+            // ── Boton A (0): pointer down / up ──
+            const aPressed = buttons[0] && buttons[0].pressed;
+            if (aPressed && !prevButtonStates[0]) {
+                dispatchSyntheticPointer('pointerdown');
+                isPointerDown = true;
+            }
+            if (!aPressed && prevButtonStates[0]) {
+                dispatchSyntheticPointer('pointerup');
+                isPointerDown = false;
+            }
+
+            // ── Boton B (1): cancelar / soltar forzado ──
+            const bPressed = buttons[1] && buttons[1].pressed;
+            if (bPressed && !prevButtonStates[1] && isPointerDown) {
+                dispatchSyntheticPointer('pointerup');
+                isPointerDown = false;
+            }
+
+            // ── Boton Y (3): colocar sobre superficie real (hit-test) ──
+            const yPressed = buttons[3] && buttons[3].pressed;
+            if (yPressed && !prevButtonStates[3]) {
+                tryPlaceOnSurface(frame, referenceSpace);
+            }
+
+            // ── Enviar pointermove cada frame para hover del gizmo ──
+            dispatchSyntheticPointer('pointermove');
+
+            // Guardar estados previos
+            for (let i = 0; i < buttons.length; i++) {
+                prevButtonStates[i] = buttons[i] ? buttons[i].pressed : false;
+            }
+        }
+
+        // Mueve el objeto a lo largo del vector camara→objeto (profundidad relativa a la vista)
+        function moveObjectInDepth(delta) {
+            if (!trophyContainer) return;
+            const dir = new THREE.Vector3()
+                .subVectors(trophyContainer.position, camera.position)
+                .normalize();
+            trophyContainer.position.add(dir.multiplyScalar(delta));
+        }
+
+        // ─── EVENTOS SINTETICOS PARA TRANSFORM CONTROLS ───
+        function dispatchSyntheticPointer(type) {
+            const rect = renderer.domElement.getBoundingClientRect();
+            const evt = new PointerEvent(type, {
+                bubbles: true,
+                cancelable: true,
+                pointerId: 999,
+                pointerType: 'mouse',
+                clientX: cursorScreen.x + rect.left,
+                clientY: cursorScreen.y + rect.top,
+                button: 0,
+                buttons: isPointerDown ? 1 : 0,
+                isPrimary: true
+            });
+            renderer.domElement.dispatchEvent(evt);
+        }
+
+        // ─── ACTUALIZAR POSICION 3D DEL CURSOR ───
+        function updateCursor3D() {
+            const pointerNorm = new THREE.Vector2(
+                (cursorScreen.x / window.innerWidth) * 2 - 1,
+                -(cursorScreen.y / window.innerHeight) * 2 + 1
+            );
+            raycaster.setFromCamera(pointerNorm, camera);
+
+            let targetDist = 1.5;
+            if (trophyContainer) {
+                targetDist = trophyContainer.position.distanceTo(camera.position);
+            }
+            cursorMesh.position.copy(camera.position).add(
+                raycaster.ray.direction.clone().multiplyScalar(targetDist)
+            );
+        }
+
+        // ─── LECTURA DE PROFUNDIDAD REAL (WebXR Depth Sensing) ───
+        function readDepthFromFrame(frame) {
+            if (!frame) return;
+            const session = renderer.xr.getSession();
+            const refSpace = renderer.xr.getReferenceSpace();
+            if (!session || !refSpace) return;
+            try {
+                const viewerPose = frame.getViewerPose(refSpace);
+                if (!viewerPose) return;
+                for (const view of viewerPose.views) {
+                    const depthInfo = frame.getDepthInformation(view);
+                    if (depthInfo) {
+                        isDepthSupplied = true;
+                        const projPos = trophyContainer.position.clone().project(camera);
+                        const u = projPos.x * 0.5 + 0.5;
+                        const v = -projPos.y * 0.5 + 0.5;
+                        if (u >= 0 && u <= 1 && v >= 0 && v <= 1) {
+                            const depth = depthInfo.getDepthInMeters(u, v);
+                            if (depth > 0.05 && depth < 8.0) {
+                                currentRealDepth = depth;
+                            }
+                        }
+                    } else {
+                        isDepthSupplied = false;
+                        currentRealDepth = -1;
+                    }
+                }
+            } catch (e) {
+                isDepthSupplied = false;
+                currentRealDepth = -1;
+            }
+        }
+
+        // ─── GUARDRAIL DE PROFUNDIDAD (Patron B) ───
+        function applyDepthClamp() {
+            if (!trophyContainer || currentRealDepth <= 0) return;
+            const dist = trophyContainer.position.distanceTo(camera.position);
+            if (dist > currentRealDepth - DEPTH_EPSILON) {
+                const dir = new THREE.Vector3()
+                    .subVectors(trophyContainer.position, camera.position)
+                    .normalize();
+                const clampedDist = Math.max(0.1, currentRealDepth - DEPTH_EPSILON);
+                trophyContainer.position.copy(
+                    camera.position.clone().add(dir.multiplyScalar(clampedDist))
+                );
+            }
+        }
+
+        function updateStatus() {
+            const gp = gamepadIndex !== null ? 'CONECTADO' : 'NO DETECTADO';
+            const mode = 'TRANSLATE';
+            const depth = isDepthSupplied ? `ON (${currentRealDepth.toFixed(2)}m)` : 'OFF';
+            const ar = renderer.xr.isPresenting ? 'AR ACTIVO' : 'AR INACTIVO';
+            statusEl.innerHTML = `Gamepad: ${gp} | Modo: ${mode} | Depth: ${depth} | ${ar}`;
+        }
+
+        // ─── LOOP PRINCIPAL ───
+        function animate() {
+            renderer.setAnimationLoop(render);
+        }
+
+        function render(time, frame) {
+            const elapsedTime = clock.getElapsedTime();
+            const refSpace = renderer.xr.getReferenceSpace();
+
+            // 1. Leer gamepad y enviar eventos sinteticos
+            pollGamepad(frame, refSpace);
+
+            // 2. Actualizar posicion visual del cursor 3D
+            updateCursor3D();
+
+            // 3. Leer profundidad real del entorno (WebXR Depth Sensing)
+            readDepthFromFrame(frame);
+
+            // 4. Aplicar guardarrail de profundidad (Patron B)
+            if (isDepthSupplied && currentRealDepth > 0) {
+                applyDepthClamp();
+            }
+
+            // 5. Animacion del trofeo (solo cuando NO se esta arrastrando)
+            if (trophyContainer && !transformControls.dragging) {
+                const model = trophyContainer.getObjectByName("animatedItem");
+                if (model) {
+                    model.rotation.y = elapsedTime * 1.5;
+                    model.position.y = Math.sin(elapsedTime * 2.5) * 0.03;
+                }
+            }
+
+            // 6. Actualizar UI de estado cada ~10 frames
+            if (Math.floor(elapsedTime * 60) % 10 === 0) updateStatus();
+
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+    </script>
+</body>
+</html>
